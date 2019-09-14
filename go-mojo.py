@@ -23,6 +23,7 @@ GOMOJO_ROOT = "/tmp/go-mojo"
 MOJO_ROOT = GOMOJO_ROOT + '/mojo'
 MOJO_VENV_ACTIVATE = GOMOJO_ROOT + "/activate"
 CHARM_TEST_INFRA_DIR = GOMOJO_ROOT + '/charm-test-infra'
+NOVARC_AUTO = "{}/novarc_auto".format(CHARM_TEST_INFRA_DIR)
 OPENSTACK_MOJO_SPEC_DIR = GOMOJO_ROOT + '/openstack-mojo-specs'
 CHARM_TEST_INFRA_TOX = CHARM_TEST_INFRA_DIR + '/tox.ini'
 MOJO_ENV_FILE = "{home}/.mojo.yaml"
@@ -68,15 +69,41 @@ def check_mojo_env_file():
             yaml.dump(DEFAULT_MOJO_ENV, outfile, default_flow_style=False)
 
 
-def prereq_checks():
+def prereq_pkg_checks():
     checks_pass = True
     for cmd, msg in PRE_REQ_PKGS.items():
         try:
-            subprocess.check_call(['which', cmd])
+            subprocess.check_call(
+                ['which', cmd],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError:
             print(msg)
             checks_pass = False
     return checks_pass
+
+
+def prereq_env_checks():
+    if os.environ.get('OS_AUTH_URL'):
+        return True
+    else:
+        print('OS_* variables not set in environment. Please source novarc '
+              'for serverstack (probably ~/novarc) and rerun')
+        return False
+
+
+def prereq_juju_check():
+    try:
+        subprocess.check_call(['juju', 'status'])
+    except subprocess.CalledProcessError:
+        print('Error accessing juju model. Please ensure a juju model is in '
+              'focus for mojo to deploy into')
+        return False
+    return True
+
+
+def prereq_checks():
+    return prereq_pkg_checks() and prereq_env_checks() and prereq_juju_check()
 
 
 def recreate_mojo_venv():
@@ -155,6 +182,34 @@ def get_mojo_run_env(spec, mojo_root, series, workspace):
     return run_env
 
 
+def create_rerun_env(rerun_file, run_env):
+    with open(rerun_file, 'w') as outfile:
+        for key, value in run_env.items():
+            outfile.write('export {}="{}"\n'.format(key, value))
+
+
+def print_rerun_message(rerun_file, run_env, spec):
+    print("\n\nIt loooks like your mojo run failed :-( ")
+    print("\n* To rerun the whole spec using the existing environment:\n")
+    print("    go-mojo.py -p -w {MOJO_WORKSPACE} -s {MOJO_SERIES} "
+          "{MOJO_STAGE}".format(**run_env))
+    print("\n\n* To rerun a specific step in the existing environment:\n")
+    print("    source {}".format(rerun_file))
+    print("    cd {}/{}".format(OPENSTACK_MOJO_SPEC_DIR, spec))
+    print("\n    Check the manifest file for any options the script might ")
+    print("    take and prepend them")
+    print("\n    e.g. if the manifest contains the following line:")
+    print("\n        verify config=simple_os_checks.py "
+          "MACHINES='trusty:m1.small:2' CLOUDINIT_WAIT='600'")
+    print("\n    Then run...")
+    print("\n        MACHINES='trusty:m1.small:2' CLOUDINIT_WAIT='600' "
+          "./simple_os_checks.py")
+    print("\n* To use openstack cli for debugging:\n")
+    print("    source {}".format(rerun_file))
+    print("    source {}".format(NOVARC_AUTO))
+    print("    openstack whatevs")
+
+
 def run_mojo(spec, mojo_root, series, workspace):
     run_env = get_mojo_run_env(spec, mojo_root, series, workspace)
     rerun_file = ('{MOJO_ROOT}/{MOJO_PROJECT}/{MOJO_SERIES}/{MOJO_WORKSPACE}/'
@@ -166,23 +221,8 @@ def run_mojo(spec, mojo_root, series, workspace):
         print(cmd)
         subprocess.check_call(cmd, env=my_env)
     except subprocess.CalledProcessError as e:
-        with open(rerun_file, 'w') as outfile:
-            for key, value in run_env.items():
-                outfile.write('export {}="{}"\n'.format(key, value))
-        print("\nIt loooks like your mojo run failed :-( ")
-        print("To rerun the whole spec using the existing environment:\n")
-        print("go-mojo.py -p -w {MOJO_WORKSPACE} -s {MOJO_SERIES} {MOJO_STAGE}".format(**run_env))
-        print("\nTo rerun a specific step in the existing environment:\n")
-        print("source {}".format(rerun_file))
-        print("cd {}/{}".format(OPENSTACK_MOJO_SPEC_DIR, spec))
-        print("\nCheck the manifest file for any options the script might ")
-        print("take and prepend them")
-        print("e.g. if the manifest contains the following line:")
-        print("    verify config=simple_os_checks.py "
-              "MACHINES='trusty:m1.small:2' CLOUDINIT_WAIT='600'")
-        print("Then run...")
-        print("MACHINES='trusty:m1.small:2' CLOUDINIT_WAIT='600' "
-              "./simple_os_checks.py")
+        create_rerun_env(rerun_file, run_env)
+        print_rerun_message(rerun_file, run_env, spec)
 
 
 def parse_args():
@@ -206,7 +246,8 @@ def parse_args():
     parser.add_argument(
         "-w",
         "--workspace-name",
-        help="Specify workspace name to use. Useful when rerunning a spec and reusing the existing environment.")
+        help=("Specify workspace name to use. Useful when rerunning a spec "
+              "and reusing the existing environment."))
     parser.add_argument(
         "-l",
         "--local-spec-dir",
@@ -221,8 +262,9 @@ if __name__ == '__main__':
     args = parse_args()
     prereq_checks() or sys.exit(1)
     recreate_venv = not args.preserve_venv
-    init_mojo(recreate_venv=recreate_venv, local_spec_dir=None)
+    init_mojo(recreate_venv=recreate_venv, local_spec_dir=args.local_spec_dir)
     check_mojo_env_file()
     init_mojo_root(MOJO_ROOT, args.series)
-    workspace_name = args.workspace_name or datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+    workspace_name = args.workspace_name or \
+        datetime.datetime.now().strftime('%Y%m%d%H%M%S')
     run_mojo(args.test_name, MOJO_ROOT, args.series, workspace_name)
